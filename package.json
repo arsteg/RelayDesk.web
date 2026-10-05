@@ -1,0 +1,65 @@
+{
+  "name": "relaydesk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:up": "docker compose up -d db",
+    "db:migrate": "node scripts/require-local-db.mjs && prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "db:reset": "node scripts/require-local-db.mjs && prisma migrate reset --force",
+    "jobs:daily": "tsx scripts/run-daily-jobs.ts",
+    "postinstall": "prisma generate",
+    "db:embedded": "node scripts/embedded-db.mjs",
+    "backup": "bash scripts/backup.sh",
+    "restore": "bash scripts/restore.sh",
+    "platform-admin": "tsx scripts/platform-admin.ts",
+    "accounts:create": "tsx scripts/create-accounts.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sesv2": "^3.1145.0",
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^18.0.5",
+    "next": "^16.3.8",
+    "nodemailer": "^10.0.13",
+    "pg": "^8.23.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "server-only": "^0.0.1",
+    "stripe": "^23.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^26.6.4",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "embedded-postgres": "^18.4.0-beta.17",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.3.8",
+    "postcss": "^8.5.28",
+    "prisma": "^7.10.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3"
+  },
+  "allowScripts": {
+    "@embedded-postgres/linux-x64@18.4.0-beta.17": true,
+    "@prisma/engines@7.10.0": true,
+    "esbuild@0.28.2": true
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

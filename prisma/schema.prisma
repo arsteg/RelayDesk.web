@@ -1,0 +1,632 @@
+// RelayDesk schema.
+//
+// Conventions
+// - Every business-owned table carries `businessId`. Child records reference their
+//   parent through a composite (businessId, id) foreign key so the database itself
+//   rejects a row that points at another tenant's record.
+// - Money is stored as integer minor units (e.g. paise for INR) in `*Minor` columns.
+// - Business history is archived (archivedAt / voidedAt), never hard-deleted.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access
+// ---------------------------------------------------------------------------
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique // stored lower-cased
+  name            String
+  passwordHash    String
+  emailVerifiedAt DateTime?
+  // Platform privileges are deliberately separate from business roles.
+  isPlatformAdmin Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  sessions    Session[]
+  memberships Membership[]
+  authTokens  AuthToken[]
+}
+
+model Session {
+  id               String   @id @default(cuid())
+  tokenHash        String   @unique // sha256 of the cookie token
+  userId           String
+  // Selected workspace. Only ever set after a membership check, and
+  // re-validated against Membership on every request.
+  activeBusinessId String?
+  expiresAt        DateTime
+  createdAt        DateTime @default(now())
+  ipAddress        String?
+  userAgent        String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+}
+
+model RateLimitBucket {
+  key         String   @id
+  count       Int
+  windowStart DateTime
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Business {
+  id              String    @id @default(cuid())
+  name            String
+  phone           String?
+  email           String?
+  address         String?
+  website         String?
+  taxId           String? // e.g. GSTIN, shown on invoices
+  currency        String    @default("INR")
+  timezone        String    @default("Asia/Kolkata")
+  defaultTaxBps   Int       @default(0) // basis points; 500 = 5.00%
+  invoiceFooter   String?
+  invoicePrefix   String    @default("ORD-")
+  logoData        Bytes?
+  logoMimeType    String?
+  // Razorpay credentials for THIS supplier's own account. Customer order
+  // payments settle to the supplier, never to the platform. (Platform/SaaS
+  // billing uses the platform's own Razorpay keys from the environment.)
+  razorpayKeyId        String?
+  razorpayKeySecret    String?
+  razorpayWebhookSecret String?
+  // Per-business order counter used to allocate tenant-scoped order numbers.
+  orderSequence   Int       @default(0)
+  suspendedAt     DateTime?
+  suspendedReason String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  memberships         Membership[]
+  invitations         Invitation[]
+  subscription        Subscription?
+  clients             Client[]
+  categories          Category[]
+  products            Product[]
+  orders              Order[]
+  orderItems          OrderItem[]
+  payments            Payment[]
+  auditLogs           AuditLog[]
+  customerAccounts    CustomerAccount[]
+  customerInvitations CustomerInvitation[]
+  orderStatusHistory  OrderStatusHistory[]
+  customerPrices      CustomerPrice[]
+  tarePresets         TarePreset[]
+  orderAdjustments    OrderAdjustment[]
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  STAFF
+}
+
+model Membership {
+  id         String   @id @default(cuid())
+  userId     String
+  businessId String
+  role       Role
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+}
+
+model Invitation {
+  id          String    @id @default(cuid())
+  businessId  String
+  email       String
+  role        Role
+  tokenHash   String    @unique
+  invitedById String?
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, email])
+}
+
+// ---------------------------------------------------------------------------
+// SaaS billing (RelayDesk charging businesses) - separate from customer payments
+// ---------------------------------------------------------------------------
+
+enum Plan {
+  STARTER
+  PRO
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+// Operator-editable attributes for each subscription tier. `code` holds a `Plan`
+// enum value ("STARTER" | "PRO"); the enum stays the source of truth for the
+// tier set, this table only carries display + limits the operator can change.
+// The app falls back to built-in defaults when a row is missing.
+model PricingPlan {
+  code             String   @id // matches the Plan enum value
+  name             String
+  description      String
+  priceLabel       String
+  maxMembers       Int? // null = unlimited
+  maxMonthlyOrders Int? // null = unlimited
+  stripePriceId    String?
+  // Razorpay Plan id this tier maps to (SaaS billing on the platform account).
+  razorpayPlanId   String?
+  isPublic         Boolean  @default(true) // shown on the public pricing page
+  isActive         Boolean  @default(true) // selectable for new subscriptions
+  sortOrder        Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  businessId           String             @unique
+  plan                 Plan               @default(STARTER)
+  status               SubscriptionStatus @default(TRIALING)
+  trialEndsAt          DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean            @default(false)
+  pastDueSince         DateTime?
+  canceledAt           DateTime?
+  stripeCustomerId     String?            @unique
+  stripeSubscriptionId String?            @unique
+  // Razorpay SaaS-subscription identifiers (platform account).
+  razorpayCustomerId     String?
+  razorpaySubscriptionId String?          @unique
+  // created timestamp of the last billing-provider event applied; older events are ignored
+  lastEventAt          DateTime?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+}
+
+// Idempotency ledger for Stripe webhooks.
+model BillingEvent {
+  id          String   @id // Stripe event id
+  type        String
+  businessId  String?
+  processedAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Business data
+// ---------------------------------------------------------------------------
+
+model Client {
+  id         String    @id @default(cuid())
+  businessId String
+  name       String
+  phone      String?
+  email      String?
+  address    String?
+  notes      String?
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  business         Business          @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  orders           Order[]
+  customerAccounts CustomerAccount[]
+  customerPrices   CustomerPrice[]
+
+  @@unique([businessId, id])
+  @@index([businessId, name])
+}
+
+model Product {
+  id          String    @id @default(cuid())
+  businessId  String
+  name        String
+  categoryId  String?
+  description String?
+  // `unit` is the business-configured pricing/billing unit (e.g. item, kg, box).
+  unit        String    @default("piece")
+  priceMinor  Int // default price per `unit`; a per-customer price can override it
+  isAvailable Boolean   @default(true)
+  // Catch-weight: the billed quantity is captured during preparation (weigh/measure).
+  isVariableMeasure         Boolean  @default(false)
+  // Units a customer may order in; empty means only the pricing `unit`.
+  orderUnits                String[] @default([])
+  // Optional planning estimate of pricing-units per order-unit (order unit != pricing unit).
+  estConversionPerOrderUnit Int?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  business       Business        @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  // Composite FK keeps a product's category inside the same tenant.
+  category       Category?       @relation(fields: [businessId, categoryId], references: [businessId, id], onDelete: Restrict, onUpdate: Cascade)
+  orderItems     OrderItem[]
+  customerPrices CustomerPrice[]
+
+  @@unique([businessId, id])
+  @@index([businessId, name])
+  @@index([businessId, categoryId])
+}
+
+model Category {
+  id         String    @id @default(cuid())
+  businessId String
+  name       String
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  @@unique([businessId, id])
+  @@index([businessId, name])
+}
+
+enum OrderStatus {
+  DRAFT
+  CONFIRMED
+  IN_PROGRESS
+  READY
+  COMPLETED
+  CANCELLED
+}
+
+enum FulfillmentType {
+  PICKUP
+  DELIVERY
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  OVERPAID // paid more than currently due (e.g. after cancellation) - refund due
+}
+
+model Order {
+  id                  String          @id @default(cuid())
+  businessId          String
+  number              Int // tenant-scoped sequence
+  clientId            String
+  status              OrderStatus     @default(DRAFT)
+  orderDate           DateTime        @db.Date
+  fulfillmentAt       DateTime
+  fulfillmentType     FulfillmentType @default(PICKUP)
+  deliveryAddress     String?
+  notes               String?
+  subtotalMinor       Int             @default(0)
+  discountMinor       Int             @default(0)
+  taxBps              Int             @default(0)
+  taxMinor            Int             @default(0)
+  deliveryChargeMinor Int             @default(0)
+  totalMinor          Int             @default(0)
+  // Denormalised from Payment rows, recomputed inside the same transaction.
+  paidMinor           Int             @default(0)
+  paymentStatus       PaymentStatus   @default(UNPAID)
+  createdById         String?
+  // Set when a customer placed the order through the ordering app/API.
+  placedByCustomerId  String?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  business         Business             @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  client           Client               @relation(fields: [businessId, clientId], references: [businessId, id], onDelete: Restrict)
+  placedByCustomer CustomerAccount?     @relation("CustomerOrders", fields: [placedByCustomerId], references: [id], onDelete: SetNull)
+  items            OrderItem[]
+  payments         Payment[]
+  statusHistory    OrderStatusHistory[]
+  adjustments      OrderAdjustment[]
+
+  @@unique([businessId, number])
+  @@unique([businessId, id])
+  @@index([businessId, status])
+  @@index([businessId, fulfillmentAt])
+  @@index([businessId, clientId])
+  @@index([businessId, createdAt])
+  @@index([businessId, placedByCustomerId])
+}
+
+model OrderItem {
+  id             String  @id @default(cuid())
+  businessId     String
+  orderId        String
+  // Optional link back to the catalogue; description/price are snapshots and
+  // never change when the product is later edited.
+  productId      String?
+  description    String
+  unit           String?
+  // Billed quantity x 1000 (supports decimals). For variable-measure lines this
+  // is set from captured net measure; otherwise it equals the ordered quantity.
+  quantityMilli  Int
+  unitPriceMinor Int
+  lineTotalMinor Int
+  isCustom       Boolean @default(false)
+  position       Int     @default(0)
+  // What the customer actually ordered (before weigh/measure), and in which unit.
+  orderUnit        String?
+  orderedQtyMilli  Int?
+  // Set once a variable-measure line has been weighed/measured during preparation.
+  capturedQtyMilli Int?
+
+  business Business           @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  order    Order              @relation(fields: [businessId, orderId], references: [businessId, id], onDelete: Cascade)
+  product  Product?           @relation(fields: [productId], references: [id], onDelete: SetNull)
+  captures OrderItemCapture[]
+
+  @@index([businessId, orderId])
+}
+
+enum PaymentKind {
+  DEPOSIT
+  PAYMENT
+  REFUND
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  CARD
+  BANK_TRANSFER
+  CHEQUE
+  RAZORPAY // online payment captured through Razorpay (web/mobile)
+  OTHER
+}
+
+model Payment {
+  id           String        @id @default(cuid())
+  businessId   String
+  orderId      String
+  kind         PaymentKind
+  amountMinor  Int // always positive; REFUND subtracts
+  paidOn       DateTime      @db.Date
+  method       PaymentMethod
+  reference    String?
+  notes        String?
+  recordedById String?
+  // Corrections: payments are never edited or deleted. They are voided with a
+  // reason and re-recorded, leaving a full audit trail.
+  voidedAt     DateTime?
+  voidedById   String?
+  voidReason   String?
+  // End-of-day reconciliation: set when the collection has been reconciled.
+  reconciledAt   DateTime?
+  reconciledById String?
+  // Razorpay references when the payment was collected online.
+  razorpayOrderId   String?
+  razorpayPaymentId String? @unique
+  createdAt    DateTime      @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  order    Order    @relation(fields: [businessId, orderId], references: [businessId, id], onDelete: Restrict)
+
+  @@index([businessId, orderId])
+  @@index([businessId, paidOn])
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  businessId  String? // null for platform-level events not tied to a business
+  actorUserId String?
+  actorEmail  String?
+  scope       String   @default("business") // "business" | "platform" | "system" | "user"
+  action      String // e.g. order.created, payment.voided, member.role_changed
+  entityType  String
+  entityId    String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, createdAt])
+  @@index([scope, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Customer ordering (invited customers who place their own orders)
+// ---------------------------------------------------------------------------
+
+// A login identity for an invited customer. Linked to the business's `Client`
+// record, which remains the entity an Order references, so customer-placed and
+// staff-placed orders share one customer model.
+model CustomerAccount {
+  id              String    @id @default(cuid())
+  businessId      String
+  clientId        String
+  email           String // stored lower-cased
+  name            String
+  phone           String?
+  passwordHash    String
+  emailVerifiedAt DateTime?
+  archivedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  business Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  // Composite FK keeps the linked client inside the same tenant.
+  client   Client            @relation(fields: [businessId, clientId], references: [businessId, id], onDelete: Cascade)
+  sessions CustomerSession[]
+  orders   Order[]           @relation("CustomerOrders")
+
+  @@unique([businessId, id])
+  @@unique([businessId, email])
+  @@index([businessId, clientId])
+}
+
+model CustomerSession {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique // sha256 of the bearer token
+  customerId String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  ipAddress  String?
+  userAgent  String?
+
+  customer CustomerAccount @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+}
+
+model CustomerInvitation {
+  id          String    @id @default(cuid())
+  businessId  String
+  email       String // stored lower-cased
+  name        String?
+  phone       String?
+  // Optional existing client to link on acceptance; otherwise one is created.
+  clientId    String?
+  tokenHash   String    @unique
+  invitedById String?
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, email])
+}
+
+// Explicit transition log for an order. The audit log is still written too;
+// this table is the first-class, queryable history customers/staff read.
+model OrderStatusHistory {
+  id                  String       @id @default(cuid())
+  businessId          String
+  orderId             String
+  fromStatus          OrderStatus?
+  toStatus            OrderStatus
+  reason              String?
+  changedByUserId     String?
+  changedByCustomerId String?
+  source              String       @default("admin") // "admin" | "customer" | "system"
+  createdAt           DateTime     @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  order    Order    @relation(fields: [businessId, orderId], references: [businessId, id], onDelete: Cascade)
+
+  @@index([businessId, orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Operations: per-customer pricing, variable-measure capture, adjustments
+// ---------------------------------------------------------------------------
+
+// A customer's negotiated price for a product, in the product's pricing unit.
+// Falls back to Product.priceMinor when absent. Snapshotted onto the order line.
+model CustomerPrice {
+  id         String   @id @default(cuid())
+  businessId String
+  clientId   String
+  productId  String
+  priceMinor Int
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  client   Client   @relation(fields: [businessId, clientId], references: [businessId, id], onDelete: Cascade)
+  product  Product  @relation(fields: [businessId, productId], references: [businessId, id], onDelete: Cascade)
+
+  @@unique([businessId, clientId, productId])
+  @@index([businessId, clientId])
+  @@index([businessId, productId])
+}
+
+// Reusable packaging tare presets (e.g. crate weights) for variable-measure capture.
+model TarePreset {
+  id         String   @id @default(cuid())
+  businessId String
+  label      String
+  tareMilli  Int // tare in the pricing unit x 1000 (e.g. 2 kg -> 2000)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+}
+
+// One weigh/measure record for a variable-measure order line. Net for the line
+// is Σ(grossMilli) − Σ(tareMilli) across its captures.
+model OrderItemCapture {
+  id          String   @id @default(cuid())
+  orderItemId String
+  grossMilli  Int
+  tareMilli   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId])
+}
+
+enum AdjustmentType {
+  SHORTFALL // less received than invoiced -> reduce the line
+  NOT_DELIVERED // item not delivered -> remove the line
+  OTHER
+}
+
+// Traceable delivery/receipt adjustment applied to an invoiced order line.
+model OrderAdjustment {
+  id           String         @id @default(cuid())
+  businessId   String
+  orderId      String
+  orderItemId  String? // may be null if the line was removed
+  type         AdjustmentType
+  fromQtyMilli Int?
+  toQtyMilli   Int?
+  reason       String
+  actorUserId  String?
+  createdAt    DateTime       @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  order    Order    @relation(fields: [businessId, orderId], references: [businessId, id], onDelete: Cascade)
+
+  @@index([businessId, orderId])
+}

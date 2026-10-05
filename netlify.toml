@@ -1,0 +1,21 @@
+# Netlify configuration.
+#
+# Let the Next.js build plugin auto-detect the build command and publish dir.
+#
+# --- Secrets scanning -------------------------------------------------------
+# Every secret in this app is server-side only: there are no NEXT_PUBLIC_*
+# variables and no secret reaches the browser bundle (verified: the values do
+# not appear in .next/static). However Next.js' `output: "standalone"` and its
+# build cache write server-only env (DATABASE_URL, STRIPE_*, SES_AWS_*,
+# CRON_SECRET, NEXT_SERVER_ACTIONS_ENCRYPTION_KEY, …) into generated build
+# artifacts, which Netlify's secrets scanner would otherwise flag.
+#
+# Omit only those generated, non-browser artifacts from the scan. Browser-served
+# assets (.next/static) are deliberately NOT omitted, so a real client-side leak
+# would still fail the build.
+[build.environment]
+  SECRETS_SCAN_OMIT_PATHS = ".next/cache/**,.next/standalone/**,.netlify/**"
+
+  # If the scan still trips on a specific value, exempt the offending key(s)
+  # here instead (server-only secrets only). Uncomment and tailor as needed:
+  # SECRETS_SCAN_OMIT_KEYS = "DATABASE_URL,CRON_SECRET,STRIPE_SECRET_KEY,STRIPE_WEBHOOK_SECRET,SMTP_URL,SES_AWS_ACCESS_KEY_ID,SES_AWS_SECRET_ACCESS_KEY,NEXT_SERVER_ACTIONS_ENCRYPTION_KEY"

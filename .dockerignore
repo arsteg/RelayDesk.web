@@ -1,0 +1,10 @@
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+.dev-mail
+src/generated
+backups
+coverage
